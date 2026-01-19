@@ -1,0 +1,21 @@
+{
+  "name": "k2d",
+  "version": "1.0.0",
+  "description": "Knowledge to Data - Extract reusable knowledge assets from Claude Code usage",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
+    "build:hook": "bun build ./src/hooks/on-turn-end.ts --outfile ./.claude/plugins/k2d/hooks/on-turn-end.js --target bun",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "bun-types": "^1.0.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "glob": "^10.3.0"
+  }
+}

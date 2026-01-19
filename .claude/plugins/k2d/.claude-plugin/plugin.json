@@ -1,0 +1,7 @@
+{
+  "name": "k2d",
+  "description": "Knowledge to Data - Extract reusable knowledge assets from Claude Code usage history. Collects conversation data, file changes, config changes, and infers skill lifecycles and project phases.",
+  "author": {
+    "name": "K2D Project"
+  }
+}

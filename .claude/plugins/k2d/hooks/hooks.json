@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun ${CLAUDE_PLUGIN_ROOT}/hooks/on-turn-end.js",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

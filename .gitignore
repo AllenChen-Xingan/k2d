@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+
+# K2D data (user-specific)
+meta/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+nul
+
+# Coverage
+coverage/
+
+# User-specific Claude Code settings (not part of K2D plugin)
+.claude/settings.local.json
+.claude/ralph-loop.local.md
+.claude/skills/
+.claude/agents/
+.claude/plugins/ralph-loop/
+
+# Project planning files (development only)
+.42cog/
+plan.md
+solution.md
+solution.compacted.md
+approach-1-solution.md
