@@ -5,6 +5,7 @@
 
 import { Database } from 'bun:sqlite';
 import * as path from 'path';
+import * as fs from 'fs';
 import { schema } from './schema';
 import { getTrackingMode } from '../utils/git-detector';
 
@@ -38,12 +39,33 @@ export async function initializeDatabase(metaPath: string): Promise<K2DDatabase>
 /**
  * 打开已有数据库
  * @param metaPath meta 目录路径
- * @returns 数据库实例或 null
+ * @returns 数据库实例或 null（如果数据库不存在或未初始化）
  */
 export function openDatabase(metaPath: string): K2DDatabase | null {
   const dbPath = path.join(metaPath, 'k2d.db');
+
+  // 检查文件是否存在
+  if (!fs.existsSync(dbPath)) {
+    return null;
+  }
+
+  // 检查文件是否为空（未初始化）
+  const stats = fs.statSync(dbPath);
+  if (stats.size === 0) {
+    // 删除空文件，让后续逻辑重新创建
+    fs.unlinkSync(dbPath);
+    return null;
+  }
+
   try {
-    return new Database(dbPath);
+    const db = new Database(dbPath);
+    // 验证数据库已初始化（检查 config 表是否存在）
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config'").all();
+    if (tables.length === 0) {
+      db.close();
+      return null;
+    }
+    return db;
   } catch {
     return null;
   }

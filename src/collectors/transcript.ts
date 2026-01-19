@@ -175,26 +175,36 @@ export function extractMcpCalls(entry: TranscriptEntry): McpCall[] {
 
 /**
  * 从 transcript 解析最新的 turn
+ * 聚合最后一个用户消息之后的所有 assistant 消息
  */
 export async function parseLatestTurn(transcriptPath: string): Promise<TurnData> {
   const content = await fs.readFile(transcriptPath, 'utf-8');
   const lines = content.trim().split('\n').filter(Boolean);
 
   let latestUser: TranscriptEntry | null = null;
-  let latestAssistant: TranscriptEntry | null = null;
+  const assistantEntries: TranscriptEntry[] = [];
+  let foundUser = false;
 
-  // 从后往前找最新的 user-assistant 对
+  // 从后往前找最新的 user 消息，并收集其后的所有 assistant 消息
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const entry = JSON.parse(lines[i]) as TranscriptEntry;
       const role = entry.role || entry.message?.role || entry.type;
 
-      if (!latestAssistant && role === 'assistant') {
-        latestAssistant = entry;
-      }
-      if (latestAssistant && !latestUser && role === 'user') {
-        latestUser = entry;
-        break;
+      if (role === 'assistant' && !foundUser) {
+        // 收集 assistant 消息（从后往前，稍后需要反转）
+        assistantEntries.unshift(entry);
+      } else if (role === 'user') {
+        // 检查是否是真正的用户消息（不是工具结果）
+        const userContent = entry.content || entry.message?.content;
+        const isToolResult = Array.isArray(userContent) && userContent.some((b) => b.type === 'tool_result');
+
+        if (!isToolResult) {
+          latestUser = entry;
+          foundUser = true;
+          break;
+        }
+        // 工具结果消息不是真正的用户消息，继续往前找
       }
     } catch {
       // 跳过无效 JSON
@@ -216,31 +226,57 @@ export async function parseLatestTurn(transcriptPath: string): Promise<TurnData>
     }
   }
 
-  // 提取助手响应
+  // 聚合所有 assistant 消息的数据
   let assistantResponse = '';
-  if (latestAssistant) {
-    const assistantContent = latestAssistant.content || latestAssistant.message?.content;
+  const allToolCalls: ToolCall[] = [];
+  const allSkillUsages: SkillUsage[] = [];
+  const allMcpCalls: McpCall[] = [];
+
+  for (const entry of assistantEntries) {
+    // 提取文本响应
+    const assistantContent = entry.content || entry.message?.content;
     if (typeof assistantContent === 'string') {
-      assistantResponse = assistantContent;
+      assistantResponse += assistantContent;
     } else if (Array.isArray(assistantContent)) {
-      assistantResponse = assistantContent
+      const text = assistantContent
         .filter((b) => b.type === 'text')
         .map((b) => b.text || '')
         .join('\n');
+      if (text) assistantResponse += (assistantResponse ? '\n' : '') + text;
+    }
+
+    // 提取工具调用（去重）
+    for (const tc of extractToolCalls(entry)) {
+      if (!allToolCalls.some((t) => t.tool_name === tc.tool_name && JSON.stringify(t.parameters) === JSON.stringify(tc.parameters))) {
+        allToolCalls.push(tc);
+      }
+    }
+
+    // 提取 skill 使用
+    for (const su of extractSkillUsages(entry)) {
+      if (!allSkillUsages.some((s) => s.skill_name === su.skill_name)) {
+        allSkillUsages.push(su);
+      }
+    }
+
+    // 提取 MCP 调用
+    for (const mc of extractMcpCalls(entry)) {
+      allMcpCalls.push(mc);
     }
   }
 
   return {
     user_message: filterSensitiveData(userMessage),
     assistant_response: filterSensitiveData(assistantResponse),
-    tool_calls: latestAssistant ? extractToolCalls(latestAssistant) : [],
-    skill_usages: latestAssistant ? extractSkillUsages(latestAssistant) : [],
-    mcp_calls: latestAssistant ? extractMcpCalls(latestAssistant) : [],
+    tool_calls: allToolCalls,
+    skill_usages: allSkillUsages,
+    mcp_calls: allMcpCalls,
   };
 }
 
 /**
  * 解析完整的 transcript
+ * 一个 turn = 一个 user 消息 + 所有后续 assistant 消息（直到下一个 user）
  */
 export async function parseFullTranscript(transcriptPath: string): Promise<TurnData[]> {
   const content = await fs.readFile(transcriptPath, 'utf-8');
@@ -248,6 +284,71 @@ export async function parseFullTranscript(transcriptPath: string): Promise<TurnD
 
   const turns: TurnData[] = [];
   let currentUser: TranscriptEntry | null = null;
+  let currentAssistantEntries: TranscriptEntry[] = [];
+
+  // 辅助函数：从当前收集的数据创建一个 turn
+  const finalizeTurn = () => {
+    if (!currentUser || currentAssistantEntries.length === 0) return;
+
+    // 提取用户消息
+    let userMessage = '';
+    const userContent = currentUser.content || currentUser.message?.content;
+    if (typeof userContent === 'string') {
+      userMessage = userContent;
+    } else if (Array.isArray(userContent)) {
+      userMessage = userContent
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text || '')
+        .join('\n');
+    }
+
+    // 聚合所有 assistant entries 的数据
+    let assistantResponse = '';
+    const allToolCalls: ToolCall[] = [];
+    const allSkillUsages: SkillUsage[] = [];
+    const allMcpCalls: McpCall[] = [];
+
+    for (const entry of currentAssistantEntries) {
+      // 提取文本响应
+      const assistantContent = entry.content || entry.message?.content;
+      if (typeof assistantContent === 'string') {
+        assistantResponse += assistantContent;
+      } else if (Array.isArray(assistantContent)) {
+        const text = assistantContent
+          .filter((b) => b.type === 'text')
+          .map((b) => b.text || '')
+          .join('\n');
+        if (text) assistantResponse += (assistantResponse ? '\n' : '') + text;
+      }
+
+      // 提取工具调用（去重）
+      for (const tc of extractToolCalls(entry)) {
+        if (!allToolCalls.some((t) => t.tool_name === tc.tool_name && JSON.stringify(t.parameters) === JSON.stringify(tc.parameters))) {
+          allToolCalls.push(tc);
+        }
+      }
+
+      // 提取 skill 使用
+      for (const su of extractSkillUsages(entry)) {
+        if (!allSkillUsages.some((s) => s.skill_name === su.skill_name)) {
+          allSkillUsages.push(su);
+        }
+      }
+
+      // 提取 MCP 调用
+      for (const mc of extractMcpCalls(entry)) {
+        allMcpCalls.push(mc);
+      }
+    }
+
+    turns.push({
+      user_message: filterSensitiveData(userMessage),
+      assistant_response: filterSensitiveData(assistantResponse),
+      tool_calls: allToolCalls,
+      skill_usages: allSkillUsages,
+      mcp_calls: allMcpCalls,
+    });
+  };
 
   for (const line of lines) {
     try {
@@ -255,47 +356,29 @@ export async function parseFullTranscript(transcriptPath: string): Promise<TurnD
       const role = entry.role || entry.message?.role || entry.type;
 
       if (role === 'user') {
-        currentUser = entry;
-      } else if (role === 'assistant' && currentUser) {
-        // 提取用户消息
-        let userMessage = '';
-        const userContent = currentUser.content || currentUser.message?.content;
-        if (typeof userContent === 'string') {
-          userMessage = userContent;
-        } else if (Array.isArray(userContent)) {
-          userMessage = userContent
-            .filter((b) => b.type === 'text')
-            .map((b) => b.text || '')
-            .join('\n');
+        // 检查是否是真正的用户消息（不是工具结果）
+        const content = entry.content || entry.message?.content;
+        const isToolResult = Array.isArray(content) && content.some((b) => b.type === 'tool_result');
+
+        if (!isToolResult) {
+          // 遇到真正的用户消息，先保存之前的 turn
+          finalizeTurn();
+          currentUser = entry;
+          currentAssistantEntries = [];
         }
-
-        // 提取助手响应
-        let assistantResponse = '';
-        const assistantContent = entry.content || entry.message?.content;
-        if (typeof assistantContent === 'string') {
-          assistantResponse = assistantContent;
-        } else if (Array.isArray(assistantContent)) {
-          assistantResponse = assistantContent
-            .filter((b) => b.type === 'text')
-            .map((b) => b.text || '')
-            .join('\n');
-        }
-
-        turns.push({
-          user_message: filterSensitiveData(userMessage),
-          assistant_response: filterSensitiveData(assistantResponse),
-          tool_calls: extractToolCalls(entry),
-          skill_usages: extractSkillUsages(entry),
-          mcp_calls: extractMcpCalls(entry),
-        });
-
-        currentUser = null;
+        // 工具结果消息被忽略，它们是同一 turn 的中间部分
+      } else if (role === 'assistant') {
+        // 收集 assistant 消息
+        currentAssistantEntries.push(entry);
       }
     } catch {
       // 跳过无效 JSON
       continue;
     }
   }
+
+  // 处理最后一个 turn
+  finalizeTurn();
 
   return turns;
 }

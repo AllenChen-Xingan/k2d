@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
-import { parseLatestTurn, extractToolCalls, extractSkillUsages, extractMcpCalls } from './transcript';
+import { parseLatestTurn, parseFullTranscript, extractToolCalls, extractSkillUsages, extractMcpCalls } from './transcript';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -65,6 +65,101 @@ describe('G2.2 对话数据采集', () => {
       const turn = await parseLatestTurn(transcriptPath);
       expect(turn.user_message).not.toContain('sk-1234567890abcdefghij');
       expect(turn.assistant_response).not.toContain('sk-1234567890abcdefghij');
+    });
+
+    it('should aggregate multiple assistant messages (tool calls)', async () => {
+      const transcriptPath = path.join(tempDir, 'transcript-multi-assistant.jsonl');
+      // 模拟真实场景：一个用户消息后有多个 assistant 消息（每个包含不同的工具调用）
+      const transcript = [
+        '{"type":"user","message":{"role":"user","content":"Help me read files"}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me read"}]}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/a.ts"}}]}}',
+        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"123","content":"file content"}]}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Now editing"}]}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/a.ts"}}]}}',
+      ].join('\n');
+
+      fs.writeFileSync(transcriptPath, transcript);
+
+      const turn = await parseLatestTurn(transcriptPath);
+      expect(turn.user_message).toBe('Help me read files');
+      expect(turn.tool_calls).toHaveLength(2);
+      expect(turn.tool_calls.map((t) => t.tool_name)).toContain('Read');
+      expect(turn.tool_calls.map((t) => t.tool_name)).toContain('Edit');
+    });
+
+    it('should skip tool_result messages when finding user message', async () => {
+      const transcriptPath = path.join(tempDir, 'transcript-tool-result.jsonl');
+      const transcript = [
+        '{"type":"user","message":{"role":"user","content":"First question"}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{}}]}}',
+        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"123","content":"output"}]}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done"}]}}',
+      ].join('\n');
+
+      fs.writeFileSync(transcriptPath, transcript);
+
+      const turn = await parseLatestTurn(transcriptPath);
+      // 应该找到真正的用户消息，而不是 tool_result
+      expect(turn.user_message).toBe('First question');
+    });
+  });
+
+  describe('parseFullTranscript', () => {
+    it('should aggregate all tool calls within a turn', async () => {
+      const transcriptPath = path.join(tempDir, 'transcript-full.jsonl');
+      const transcript = [
+        '{"type":"user","message":{"role":"user","content":"Do something"}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file":"/a.ts"}}]}}',
+        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"1","content":"data"}]}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file":"/a.ts"}}]}}',
+        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"2","content":"ok"}]}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"cmd":"test"}}]}}',
+        '{"type":"user","message":{"role":"user","content":"Next question"}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Answer"}]}}',
+      ].join('\n');
+
+      fs.writeFileSync(transcriptPath, transcript);
+
+      const turns = await parseFullTranscript(transcriptPath);
+      expect(turns).toHaveLength(2);
+
+      // 第一个 turn 应该有 3 个工具调用
+      expect(turns[0].user_message).toBe('Do something');
+      expect(turns[0].tool_calls).toHaveLength(3);
+      expect(turns[0].tool_calls.map((t) => t.tool_name)).toEqual(['Read', 'Edit', 'Bash']);
+
+      // 第二个 turn 没有工具调用
+      expect(turns[1].user_message).toBe('Next question');
+      expect(turns[1].tool_calls).toHaveLength(0);
+    });
+
+    it('should filter out tool_result user messages', async () => {
+      const transcriptPath = path.join(tempDir, 'transcript-filter-tool-result.jsonl');
+      const transcript = [
+        '{"type":"user","message":{"role":"user","content":"Question 1"}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{}}]}}',
+        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"1","content":"data"}]}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done 1"}]}}',
+        '{"type":"user","message":{"role":"user","content":"Question 2"}}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done 2"}]}}',
+      ].join('\n');
+
+      fs.writeFileSync(transcriptPath, transcript);
+
+      const turns = await parseFullTranscript(transcriptPath);
+      // 应该只有 2 个 turn，tool_result 不算新的 turn
+      expect(turns).toHaveLength(2);
+      expect(turns[0].user_message).toBe('Question 1');
+      expect(turns[1].user_message).toBe('Question 2');
+    });
+
+    it('should handle empty transcript', async () => {
+      const transcriptPath = path.join(tempDir, 'transcript-empty.jsonl');
+      fs.writeFileSync(transcriptPath, '');
+
+      const turns = await parseFullTranscript(transcriptPath);
+      expect(turns).toHaveLength(0);
     });
   });
 
