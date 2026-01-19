@@ -17,7 +17,7 @@ import { parseLatestTurn, parseFullTranscript, type TurnData } from '../collecto
 import { collectGitChanges, createSnapshot, diffSnapshots, snapshotDiffToChanges, loadLatestSnapshot, saveSnapshot } from '../collectors/file-changes';
 import { collectClaudeConfig, detectConfigChanges, ConfigSnapshot } from '../collectors/config-changes';
 import { inferSkillIntroductionReason } from '../extractors/skill-inference';
-import { inferProjectPhase, detectPhaseTransition } from '../extractors/phase-inference';
+import { inferProjectPhase } from '../extractors/phase-inference';
 import { createSession, saveCompleteTurnData, updateSkillLifecycle, recordPhaseTransition, getProjectPhases } from '../db/operations';
 import { getConfig, setConfig } from '../db/init';
 import { detectGitRepo } from '../utils/git-detector';
@@ -34,7 +34,9 @@ interface HookOutput {
   skipped: boolean;
   reason?: string;
   turnId?: number;
-  imported?: number;  // 回溯导入的历史轮次数
+  imported?: number;           // 回溯导入的历史轮次数
+  importedSessions?: number;   // 导入的 session 数
+  importedTools?: number;      // 导入的工具调用数
 }
 
 async function readStdin(): Promise<string> {
@@ -54,34 +56,67 @@ function isDatabaseEmpty(db: K2DDatabase): boolean {
 }
 
 /**
- * 回溯导入历史对话
+ * 获取项目的所有 session 文件
  */
-async function importHistoricalTurns(
+async function getAllSessionFiles(transcriptPath: string): Promise<string[]> {
+  const projectDir = path.dirname(transcriptPath);
+  const files = await fs.readdir(projectDir);
+  return files
+    .filter((f) => f.endsWith('.jsonl'))
+    .map((f) => path.join(projectDir, f))
+    .sort(); // 按文件名排序（通常是 UUID，可以保持一定顺序）
+}
+
+/**
+ * 从 transcript 路径提取 session ID
+ */
+function extractSessionId(transcriptPath: string): string {
+  const filename = path.basename(transcriptPath, '.jsonl');
+  return filename;
+}
+
+/**
+ * 导入单个 session 的所有历史对话
+ */
+async function importSessionTurns(
   db: K2DDatabase,
   transcriptPath: string,
-  sessionId: string,
-  projectPath: string
-): Promise<number> {
+  projectPath: string,
+  globalTurnOffset: number,
+  excludeLastTurn: boolean = false
+): Promise<{ turnCount: number; toolCount: number }> {
+  const sessionId = extractSessionId(transcriptPath);
+
+  // 检查 session 是否已导入
+  const existingSession = db.prepare('SELECT id FROM sessions WHERE id = ?').get(sessionId);
+  if (existingSession) {
+    return { turnCount: 0, toolCount: 0 };
+  }
+
   // 解析完整的对话历史
   const allTurns = await parseFullTranscript(transcriptPath);
 
-  if (allTurns.length <= 1) {
-    // 只有一轮或没有对话，不需要回溯
-    return 0;
+  if (allTurns.length === 0) {
+    return { turnCount: 0, toolCount: 0 };
   }
 
-  // 导入除最后一轮之外的所有历史对话（最后一轮会在正常流程中处理）
-  const historicalTurns = allTurns.slice(0, -1);
+  // 创建 session
+  const stmt = db.prepare('INSERT INTO sessions (id, project_path, started_at, turn_count) VALUES (?, ?, ?, ?)');
+  stmt.run(sessionId, projectPath, new Date().toISOString(), allTurns.length);
 
   // 获取当前配置作为快照
   const configSnapshot = await collectClaudeConfig(projectPath);
 
-  for (let i = 0; i < historicalTurns.length; i++) {
-    const turnData = historicalTurns[i];
-    const turnNumber = i + 1;
+  // 决定导入哪些 turns
+  const turnsToImport = excludeLastTurn ? allTurns.slice(0, -1) : allTurns;
+  let toolCount = 0;
 
-    // 保存历史轮次（不收集文件变更和配置变更，因为无法回溯）
-    saveCompleteTurnData(db, {
+  for (let i = 0; i < turnsToImport.length; i++) {
+    const turnData = turnsToImport[i];
+    const turnNumber = globalTurnOffset + i + 1;
+
+    // 保存轮次
+    const turnId = saveCompleteTurnData(db, {
       sessionId,
       turnNumber,
       turnData,
@@ -90,17 +125,59 @@ async function importHistoricalTurns(
       configChanges: [],
     });
 
+    toolCount += turnData.tool_calls.length;
+
     // 更新 skill lifecycle
     for (const skillUsage of turnData.skill_usages) {
       const inference = inferSkillIntroductionReason(turnData.user_message, skillUsage.skill_name);
-      updateSkillLifecycle(db, skillUsage.skill_name, i + 1, inference.reason);
+      updateSkillLifecycle(db, skillUsage.skill_name, turnId, inference.reason);
     }
   }
 
-  // 更新 turn number
-  setConfig(db, 'current_turn_number', historicalTurns.length.toString());
+  // 更新 session turn count
+  db.prepare('UPDATE sessions SET turn_count = ? WHERE id = ?').run(turnsToImport.length, sessionId);
 
-  return historicalTurns.length;
+  return { turnCount: turnsToImport.length, toolCount };
+}
+
+/**
+ * 回溯导入所有历史 session
+ */
+async function importAllHistoricalSessions(
+  db: K2DDatabase,
+  currentTranscriptPath: string,
+  projectPath: string
+): Promise<{ sessions: number; turns: number; tools: number }> {
+  const allSessionFiles = await getAllSessionFiles(currentTranscriptPath);
+  const currentSessionFile = currentTranscriptPath;
+
+  let totalTurns = 0;
+  let totalTools = 0;
+  let importedSessions = 0;
+
+  for (const sessionFile of allSessionFiles) {
+    const isCurrentSession = path.resolve(sessionFile) === path.resolve(currentSessionFile);
+
+    // 对于当前 session，排除最后一轮（会在正常流程中处理）
+    const result = await importSessionTurns(
+      db,
+      sessionFile,
+      projectPath,
+      totalTurns,
+      isCurrentSession
+    );
+
+    if (result.turnCount > 0) {
+      importedSessions++;
+      totalTurns += result.turnCount;
+      totalTools += result.toolCount;
+    }
+  }
+
+  // 更新全局 turn number
+  setConfig(db, 'current_turn_number', totalTurns.toString());
+
+  return { sessions: importedSessions, turns: totalTurns, tools: totalTools };
 }
 
 async function main(): Promise<void> {
@@ -138,17 +215,26 @@ async function main(): Promise<void> {
       setConfig(db, 'initialized_at', new Date().toISOString());
     }
 
-    // 3. 获取或创建 session
-    let sessionId = getConfig(db, 'current_session_id');
-    if (!sessionId) {
-      sessionId = createSession(db, projectPath);
-      setConfig(db, 'current_session_id', sessionId);
+    // 3. 检测是否需要回溯导入所有历史 session
+    let importedStats = { sessions: 0, turns: 0, tools: 0 };
+    if (isNewDatabase || isDatabaseEmpty(db)) {
+      importedStats = await importAllHistoricalSessions(db, input.transcript_path, projectPath);
     }
 
-    // 4. 检测是否需要回溯导入历史对话
-    let importedCount = 0;
-    if (isNewDatabase || isDatabaseEmpty(db)) {
-      importedCount = await importHistoricalTurns(db, input.transcript_path, sessionId, projectPath);
+    // 4. 获取或创建当前 session
+    const currentSessionId = extractSessionId(input.transcript_path);
+    let sessionId = getConfig(db, 'current_session_id');
+
+    // 如果 session 切换了，更新当前 session
+    if (sessionId !== currentSessionId) {
+      // 检查 session 是否已存在
+      const existingSession = db.prepare('SELECT id FROM sessions WHERE id = ?').get(currentSessionId);
+      if (!existingSession) {
+        const stmt = db.prepare('INSERT INTO sessions (id, project_path, started_at, turn_count) VALUES (?, ?, ?, ?)');
+        stmt.run(currentSessionId, projectPath, new Date().toISOString(), 0);
+      }
+      sessionId = currentSessionId;
+      setConfig(db, 'current_session_id', sessionId);
     }
 
     // 5. 获取当前 turn number
@@ -217,15 +303,20 @@ async function main(): Promise<void> {
       recordPhaseTransition(db, currentPhase, turnId, skillNames, toolNames);
     }
 
-    // 12. 更新 session turn count
-    db.prepare('UPDATE sessions SET turn_count = ? WHERE id = ?').run(turnNumber, sessionId);
+    // 12. 更新 session turn count（统计该 session 的实际轮次数）
+    const sessionTurnCount = db.prepare('SELECT COUNT(*) as count FROM turns WHERE session_id = ?').get(sessionId) as { count: number };
+    db.prepare('UPDATE sessions SET turn_count = ? WHERE id = ?').run(sessionTurnCount.count, sessionId);
 
     db.close();
 
     const output: HookOutput = {
       skipped: false,
       turnId,
-      ...(importedCount > 0 ? { imported: importedCount } : {})
+      ...(importedStats.turns > 0 ? {
+        imported: importedStats.turns,
+        importedSessions: importedStats.sessions,
+        importedTools: importedStats.tools
+      } : {})
     };
     console.log(JSON.stringify(output));
   } catch (error) {

@@ -91,6 +91,38 @@ describe('G1.3 数据库初始化', () => {
       const db = openDatabase(path.join(tempDir, 'nonexistent'));
       expect(db).toBeNull();
     });
+
+    it('should return null and delete empty database file', () => {
+      const emptyDbPath = path.join(tempDir, 'empty-meta');
+      fs.mkdirSync(emptyDbPath, { recursive: true });
+      const dbFilePath = path.join(emptyDbPath, 'k2d.db');
+
+      // 创建空文件
+      fs.writeFileSync(dbFilePath, '');
+      expect(fs.existsSync(dbFilePath)).toBe(true);
+      expect(fs.statSync(dbFilePath).size).toBe(0);
+
+      // openDatabase 应该返回 null 并删除空文件
+      const db = openDatabase(emptyDbPath);
+      expect(db).toBeNull();
+      expect(fs.existsSync(dbFilePath)).toBe(false);
+    });
+
+    it('should return null for database without config table', async () => {
+      const noConfigPath = path.join(tempDir, 'no-config-meta');
+      fs.mkdirSync(noConfigPath, { recursive: true });
+      const dbFilePath = path.join(noConfigPath, 'k2d.db');
+
+      // 创建数据库但不初始化 schema
+      const { Database } = await import('bun:sqlite');
+      const rawDb = new Database(dbFilePath);
+      rawDb.exec('CREATE TABLE test (id INTEGER PRIMARY KEY)');
+      rawDb.close();
+
+      // openDatabase 应该返回 null（因为没有 config 表）
+      const db = openDatabase(noConfigPath);
+      expect(db).toBeNull();
+    });
   });
 
   describe('database schema', () => {

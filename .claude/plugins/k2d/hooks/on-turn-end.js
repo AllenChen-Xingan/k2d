@@ -226,6 +226,7 @@ var require_brace_expansion = __commonJS((exports, module) => {
 
 // src/hooks/on-turn-end.ts
 import * as path6 from "path";
+import * as fs6 from "fs/promises";
 
 // src/init/create-directories.ts
 import * as fs from "fs/promises";
@@ -263,6 +264,7 @@ async function isMetaInitialized(projectPath) {
 // src/db/init.ts
 import { Database } from "bun:sqlite";
 import * as path2 from "path";
+import * as fs2 from "fs";
 
 // src/db/schema.ts
 var schema = `
@@ -482,8 +484,22 @@ async function initializeDatabase(metaPath) {
 }
 function openDatabase(metaPath) {
   const dbPath = path2.join(metaPath, "k2d.db");
+  if (!fs2.existsSync(dbPath)) {
+    return null;
+  }
+  const stats = fs2.statSync(dbPath);
+  if (stats.size === 0) {
+    fs2.unlinkSync(dbPath);
+    return null;
+  }
   try {
-    return new Database(dbPath);
+    const db = new Database(dbPath);
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config'").all();
+    if (tables.length === 0) {
+      db.close();
+      return null;
+    }
+    return db;
   } catch {
     return null;
   }
@@ -497,7 +513,7 @@ function setConfig(db, key, value) {
 }
 
 // src/collectors/transcript.ts
-import * as fs2 from "fs/promises";
+import * as fs3 from "fs/promises";
 
 // src/utils/sensitive-filter.ts
 var SENSITIVE_PATTERNS = [
@@ -613,21 +629,26 @@ function extractMcpCalls(entry) {
   return mcpCalls;
 }
 async function parseLatestTurn(transcriptPath) {
-  const content = await fs2.readFile(transcriptPath, "utf-8");
+  const content = await fs3.readFile(transcriptPath, "utf-8");
   const lines = content.trim().split(`
 `).filter(Boolean);
   let latestUser = null;
-  let latestAssistant = null;
+  const assistantEntries = [];
+  let foundUser = false;
   for (let i = lines.length - 1;i >= 0; i--) {
     try {
       const entry = JSON.parse(lines[i]);
       const role = entry.role || entry.message?.role || entry.type;
-      if (!latestAssistant && role === "assistant") {
-        latestAssistant = entry;
-      }
-      if (latestAssistant && !latestUser && role === "user") {
-        latestUser = entry;
-        break;
+      if (role === "assistant" && !foundUser) {
+        assistantEntries.unshift(entry);
+      } else if (role === "user") {
+        const userContent = entry.content || entry.message?.content;
+        const isToolResult = Array.isArray(userContent) && userContent.some((b) => b.type === "tool_result");
+        if (!isToolResult) {
+          latestUser = entry;
+          foundUser = true;
+          break;
+        }
       }
     } catch {
       continue;
@@ -644,72 +665,124 @@ async function parseLatestTurn(transcriptPath) {
     }
   }
   let assistantResponse = "";
-  if (latestAssistant) {
-    const assistantContent = latestAssistant.content || latestAssistant.message?.content;
+  const allToolCalls = [];
+  const allSkillUsages = [];
+  const allMcpCalls = [];
+  for (const entry of assistantEntries) {
+    const assistantContent = entry.content || entry.message?.content;
     if (typeof assistantContent === "string") {
-      assistantResponse = assistantContent;
+      assistantResponse += assistantContent;
     } else if (Array.isArray(assistantContent)) {
-      assistantResponse = assistantContent.filter((b) => b.type === "text").map((b) => b.text || "").join(`
+      const text = assistantContent.filter((b) => b.type === "text").map((b) => b.text || "").join(`
 `);
+      if (text)
+        assistantResponse += (assistantResponse ? `
+` : "") + text;
+    }
+    for (const tc of extractToolCalls(entry)) {
+      if (!allToolCalls.some((t) => t.tool_name === tc.tool_name && JSON.stringify(t.parameters) === JSON.stringify(tc.parameters))) {
+        allToolCalls.push(tc);
+      }
+    }
+    for (const su of extractSkillUsages(entry)) {
+      if (!allSkillUsages.some((s) => s.skill_name === su.skill_name)) {
+        allSkillUsages.push(su);
+      }
+    }
+    for (const mc of extractMcpCalls(entry)) {
+      allMcpCalls.push(mc);
     }
   }
   return {
     user_message: filterSensitiveData(userMessage),
     assistant_response: filterSensitiveData(assistantResponse),
-    tool_calls: latestAssistant ? extractToolCalls(latestAssistant) : [],
-    skill_usages: latestAssistant ? extractSkillUsages(latestAssistant) : [],
-    mcp_calls: latestAssistant ? extractMcpCalls(latestAssistant) : []
+    tool_calls: allToolCalls,
+    skill_usages: allSkillUsages,
+    mcp_calls: allMcpCalls
   };
 }
 async function parseFullTranscript(transcriptPath) {
-  const content = await fs2.readFile(transcriptPath, "utf-8");
+  const content = await fs3.readFile(transcriptPath, "utf-8");
   const lines = content.trim().split(`
 `).filter(Boolean);
   const turns = [];
   let currentUser = null;
+  let currentAssistantEntries = [];
+  const finalizeTurn = () => {
+    if (!currentUser || currentAssistantEntries.length === 0)
+      return;
+    let userMessage = "";
+    const userContent = currentUser.content || currentUser.message?.content;
+    if (typeof userContent === "string") {
+      userMessage = userContent;
+    } else if (Array.isArray(userContent)) {
+      userMessage = userContent.filter((b) => b.type === "text").map((b) => b.text || "").join(`
+`);
+    }
+    let assistantResponse = "";
+    const allToolCalls = [];
+    const allSkillUsages = [];
+    const allMcpCalls = [];
+    for (const entry of currentAssistantEntries) {
+      const assistantContent = entry.content || entry.message?.content;
+      if (typeof assistantContent === "string") {
+        assistantResponse += assistantContent;
+      } else if (Array.isArray(assistantContent)) {
+        const text = assistantContent.filter((b) => b.type === "text").map((b) => b.text || "").join(`
+`);
+        if (text)
+          assistantResponse += (assistantResponse ? `
+` : "") + text;
+      }
+      for (const tc of extractToolCalls(entry)) {
+        if (!allToolCalls.some((t) => t.tool_name === tc.tool_name && JSON.stringify(t.parameters) === JSON.stringify(tc.parameters))) {
+          allToolCalls.push(tc);
+        }
+      }
+      for (const su of extractSkillUsages(entry)) {
+        if (!allSkillUsages.some((s) => s.skill_name === su.skill_name)) {
+          allSkillUsages.push(su);
+        }
+      }
+      for (const mc of extractMcpCalls(entry)) {
+        allMcpCalls.push(mc);
+      }
+    }
+    turns.push({
+      user_message: filterSensitiveData(userMessage),
+      assistant_response: filterSensitiveData(assistantResponse),
+      tool_calls: allToolCalls,
+      skill_usages: allSkillUsages,
+      mcp_calls: allMcpCalls
+    });
+  };
   for (const line of lines) {
     try {
       const entry = JSON.parse(line);
       const role = entry.role || entry.message?.role || entry.type;
       if (role === "user") {
-        currentUser = entry;
-      } else if (role === "assistant" && currentUser) {
-        let userMessage = "";
-        const userContent = currentUser.content || currentUser.message?.content;
-        if (typeof userContent === "string") {
-          userMessage = userContent;
-        } else if (Array.isArray(userContent)) {
-          userMessage = userContent.filter((b) => b.type === "text").map((b) => b.text || "").join(`
-`);
+        const content2 = entry.content || entry.message?.content;
+        const isToolResult = Array.isArray(content2) && content2.some((b) => b.type === "tool_result");
+        if (!isToolResult) {
+          finalizeTurn();
+          currentUser = entry;
+          currentAssistantEntries = [];
         }
-        let assistantResponse = "";
-        const assistantContent = entry.content || entry.message?.content;
-        if (typeof assistantContent === "string") {
-          assistantResponse = assistantContent;
-        } else if (Array.isArray(assistantContent)) {
-          assistantResponse = assistantContent.filter((b) => b.type === "text").map((b) => b.text || "").join(`
-`);
-        }
-        turns.push({
-          user_message: filterSensitiveData(userMessage),
-          assistant_response: filterSensitiveData(assistantResponse),
-          tool_calls: extractToolCalls(entry),
-          skill_usages: extractSkillUsages(entry),
-          mcp_calls: extractMcpCalls(entry)
-        });
-        currentUser = null;
+      } else if (role === "assistant") {
+        currentAssistantEntries.push(entry);
       }
     } catch {
       continue;
     }
   }
+  finalizeTurn();
   return turns;
 }
 
 // src/collectors/file-changes.ts
 import { exec as exec2 } from "child_process";
 import { promisify as promisify2 } from "util";
-import * as fs3 from "fs/promises";
+import * as fs4 from "fs/promises";
 import * as path4 from "path";
 import * as crypto from "crypto";
 
@@ -4493,8 +4566,8 @@ class PathScurryBase {
   #children;
   nocase;
   #fs;
-  constructor(cwd = process.cwd(), pathImpl, sep2, { nocase, childrenCacheSize = 16 * 1024, fs: fs3 = defaultFS } = {}) {
-    this.#fs = fsFromOption(fs3);
+  constructor(cwd = process.cwd(), pathImpl, sep2, { nocase, childrenCacheSize = 16 * 1024, fs: fs4 = defaultFS } = {}) {
+    this.#fs = fsFromOption(fs4);
     if (cwd instanceof URL || cwd.startsWith("file://")) {
       cwd = fileURLToPath(cwd);
     }
@@ -4970,8 +5043,8 @@ class PathScurryWin32 extends PathScurryBase {
   parseRootPath(dir) {
     return win32.parse(dir).root.toUpperCase();
   }
-  newRoot(fs3) {
-    return new PathWin32(this.rootPath, IFDIR, undefined, this.roots, this.nocase, this.childrenCache(), { fs: fs3 });
+  newRoot(fs4) {
+    return new PathWin32(this.rootPath, IFDIR, undefined, this.roots, this.nocase, this.childrenCache(), { fs: fs4 });
   }
   isAbsolute(p) {
     return p.startsWith("/") || p.startsWith("\\") || /^[a-z]:(\/|\\)/i.test(p);
@@ -4988,8 +5061,8 @@ class PathScurryPosix extends PathScurryBase {
   parseRootPath(_dir) {
     return "/";
   }
-  newRoot(fs3) {
-    return new PathPosix(this.rootPath, IFDIR, undefined, this.roots, this.nocase, this.childrenCache(), { fs: fs3 });
+  newRoot(fs4) {
+    return new PathPosix(this.rootPath, IFDIR, undefined, this.roots, this.nocase, this.childrenCache(), { fs: fs4 });
   }
   isAbsolute(p) {
     return p.startsWith("/");
@@ -6051,7 +6124,7 @@ async function collectGitChanges(cwd) {
 }
 var IGNORE_PATTERNS = ["**/node_modules/**", "**/.git/**", "**/meta/snapshots/**", "**/dist/**", "**/.next/**"];
 async function computeFileHash(filePath) {
-  const content = await fs3.readFile(filePath);
+  const content = await fs4.readFile(filePath);
   return crypto.createHash("md5").update(content).digest("hex");
 }
 async function createSnapshot(projectPath) {
@@ -6065,7 +6138,7 @@ async function createSnapshot(projectPath) {
   for (const file of allFiles) {
     const fullPath = path4.join(projectPath, file);
     try {
-      const stat3 = await fs3.stat(fullPath);
+      const stat3 = await fs4.stat(fullPath);
       if (stat3.isFile()) {
         const hash = await computeFileHash(fullPath);
         files[file] = {
@@ -6141,21 +6214,21 @@ function snapshotDiffToChanges(diff, oldSnap, newSnap) {
 }
 async function saveSnapshot(metaPath, snapshot) {
   const snapshotsDir = path4.join(metaPath, "snapshots");
-  await fs3.mkdir(snapshotsDir, { recursive: true });
+  await fs4.mkdir(snapshotsDir, { recursive: true });
   const filename = `snapshot-${Date.now()}.json`;
   const filePath = path4.join(snapshotsDir, filename);
-  await fs3.writeFile(filePath, JSON.stringify(snapshot, null, 2));
+  await fs4.writeFile(filePath, JSON.stringify(snapshot, null, 2));
   return filePath;
 }
 async function loadLatestSnapshot(metaPath) {
   const snapshotsDir = path4.join(metaPath, "snapshots");
   try {
-    const files = await fs3.readdir(snapshotsDir);
+    const files = await fs4.readdir(snapshotsDir);
     const snapshotFiles = files.filter((f) => f.startsWith("snapshot-") && f.endsWith(".json")).sort().reverse();
     if (snapshotFiles.length === 0)
       return null;
     const latestPath = path4.join(snapshotsDir, snapshotFiles[0]);
-    const content = await fs3.readFile(latestPath, "utf-8");
+    const content = await fs4.readFile(latestPath, "utf-8");
     return JSON.parse(content);
   } catch {
     return null;
@@ -6163,11 +6236,11 @@ async function loadLatestSnapshot(metaPath) {
 }
 
 // src/collectors/config-changes.ts
-import * as fs4 from "fs/promises";
+import * as fs5 from "fs/promises";
 import * as path5 from "path";
 async function safeReadFile(filePath) {
   try {
-    return await fs4.readFile(filePath, "utf-8");
+    return await fs5.readFile(filePath, "utf-8");
   } catch {
     return null;
   }
@@ -6213,13 +6286,13 @@ async function collectClaudeConfig(projectPath) {
 async function listSkills(claudeDir) {
   const skillsDir = path5.join(claudeDir, "skills");
   try {
-    const entries = await fs4.readdir(skillsDir, { withFileTypes: true });
+    const entries = await fs5.readdir(skillsDir, { withFileTypes: true });
     const skills = [];
     for (const entry of entries) {
       if (entry.isDirectory()) {
         const skillMd = path5.join(skillsDir, entry.name, "SKILL.md");
         try {
-          await fs4.access(skillMd);
+          await fs5.access(skillMd);
           skills.push(entry.name);
         } catch {}
       }
@@ -6232,13 +6305,13 @@ async function listSkills(claudeDir) {
 async function listPlugins(claudeDir) {
   const pluginsDir = path5.join(claudeDir, "plugins");
   try {
-    const entries = await fs4.readdir(pluginsDir, { withFileTypes: true });
+    const entries = await fs5.readdir(pluginsDir, { withFileTypes: true });
     const plugins = [];
     for (const entry of entries) {
       if (entry.isDirectory()) {
         const pluginJson = path5.join(pluginsDir, entry.name, ".claude-plugin", "plugin.json");
         try {
-          await fs4.access(pluginJson);
+          await fs5.access(pluginJson);
           plugins.push(entry.name);
         } catch {}
       }
@@ -6519,15 +6592,6 @@ function inferProjectPhase(params) {
 }
 
 // src/db/operations.ts
-function createSession(db, projectPath) {
-  const id = `session-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-  const now = new Date().toISOString();
-  db.prepare(`
-    INSERT INTO sessions (id, project_path, started_at, turn_count)
-    VALUES (?, ?, ?, 0)
-  `).run(id, projectPath, now);
-  return id;
-}
 function createTurn(db, sessionId, turnNumber, userMessage, assistantResponse) {
   const result = db.prepare(`
     INSERT INTO turns (session_id, turn_number, user_message, assistant_response)
@@ -6656,17 +6720,34 @@ function isDatabaseEmpty(db) {
   const result = db.prepare("SELECT COUNT(*) as count FROM turns").get();
   return result.count === 0;
 }
-async function importHistoricalTurns(db, transcriptPath, sessionId, projectPath) {
-  const allTurns = await parseFullTranscript(transcriptPath);
-  if (allTurns.length <= 1) {
-    return 0;
+async function getAllSessionFiles(transcriptPath) {
+  const projectDir = path6.dirname(transcriptPath);
+  const files = await fs6.readdir(projectDir);
+  return files.filter((f) => f.endsWith(".jsonl")).map((f) => path6.join(projectDir, f)).sort();
+}
+function extractSessionId(transcriptPath) {
+  const filename = path6.basename(transcriptPath, ".jsonl");
+  return filename;
+}
+async function importSessionTurns(db, transcriptPath, projectPath, globalTurnOffset, excludeLastTurn = false) {
+  const sessionId = extractSessionId(transcriptPath);
+  const existingSession = db.prepare("SELECT id FROM sessions WHERE id = ?").get(sessionId);
+  if (existingSession) {
+    return { turnCount: 0, toolCount: 0 };
   }
-  const historicalTurns = allTurns.slice(0, -1);
+  const allTurns = await parseFullTranscript(transcriptPath);
+  if (allTurns.length === 0) {
+    return { turnCount: 0, toolCount: 0 };
+  }
+  const stmt = db.prepare("INSERT INTO sessions (id, project_path, started_at, turn_count) VALUES (?, ?, ?, ?)");
+  stmt.run(sessionId, projectPath, new Date().toISOString(), allTurns.length);
   const configSnapshot = await collectClaudeConfig(projectPath);
-  for (let i = 0;i < historicalTurns.length; i++) {
-    const turnData = historicalTurns[i];
-    const turnNumber = i + 1;
-    saveCompleteTurnData(db, {
+  const turnsToImport = excludeLastTurn ? allTurns.slice(0, -1) : allTurns;
+  let toolCount = 0;
+  for (let i = 0;i < turnsToImport.length; i++) {
+    const turnData = turnsToImport[i];
+    const turnNumber = globalTurnOffset + i + 1;
+    const turnId = saveCompleteTurnData(db, {
       sessionId,
       turnNumber,
       turnData,
@@ -6674,13 +6755,32 @@ async function importHistoricalTurns(db, transcriptPath, sessionId, projectPath)
       configSnapshot,
       configChanges: []
     });
+    toolCount += turnData.tool_calls.length;
     for (const skillUsage of turnData.skill_usages) {
       const inference = inferSkillIntroductionReason(turnData.user_message, skillUsage.skill_name);
-      updateSkillLifecycle(db, skillUsage.skill_name, i + 1, inference.reason);
+      updateSkillLifecycle(db, skillUsage.skill_name, turnId, inference.reason);
     }
   }
-  setConfig(db, "current_turn_number", historicalTurns.length.toString());
-  return historicalTurns.length;
+  db.prepare("UPDATE sessions SET turn_count = ? WHERE id = ?").run(turnsToImport.length, sessionId);
+  return { turnCount: turnsToImport.length, toolCount };
+}
+async function importAllHistoricalSessions(db, currentTranscriptPath, projectPath) {
+  const allSessionFiles = await getAllSessionFiles(currentTranscriptPath);
+  const currentSessionFile = currentTranscriptPath;
+  let totalTurns = 0;
+  let totalTools = 0;
+  let importedSessions = 0;
+  for (const sessionFile of allSessionFiles) {
+    const isCurrentSession = path6.resolve(sessionFile) === path6.resolve(currentSessionFile);
+    const result = await importSessionTurns(db, sessionFile, projectPath, totalTurns, isCurrentSession);
+    if (result.turnCount > 0) {
+      importedSessions++;
+      totalTurns += result.turnCount;
+      totalTools += result.toolCount;
+    }
+  }
+  setConfig(db, "current_turn_number", totalTurns.toString());
+  return { sessions: importedSessions, turns: totalTurns, tools: totalTools };
 }
 async function main() {
   try {
@@ -6706,14 +6806,20 @@ async function main() {
       setConfig(db, "tracking_mode", trackingMode2);
       setConfig(db, "initialized_at", new Date().toISOString());
     }
-    let sessionId = getConfig(db, "current_session_id");
-    if (!sessionId) {
-      sessionId = createSession(db, projectPath);
-      setConfig(db, "current_session_id", sessionId);
-    }
-    let importedCount = 0;
+    let importedStats = { sessions: 0, turns: 0, tools: 0 };
     if (isNewDatabase || isDatabaseEmpty(db)) {
-      importedCount = await importHistoricalTurns(db, input.transcript_path, sessionId, projectPath);
+      importedStats = await importAllHistoricalSessions(db, input.transcript_path, projectPath);
+    }
+    const currentSessionId = extractSessionId(input.transcript_path);
+    let sessionId = getConfig(db, "current_session_id");
+    if (sessionId !== currentSessionId) {
+      const existingSession = db.prepare("SELECT id FROM sessions WHERE id = ?").get(currentSessionId);
+      if (!existingSession) {
+        const stmt = db.prepare("INSERT INTO sessions (id, project_path, started_at, turn_count) VALUES (?, ?, ?, ?)");
+        stmt.run(currentSessionId, projectPath, new Date().toISOString(), 0);
+      }
+      sessionId = currentSessionId;
+      setConfig(db, "current_session_id", sessionId);
     }
     const turnCountStr = getConfig(db, "current_turn_number") || "0";
     const turnNumber = parseInt(turnCountStr, 10) + 1;
@@ -6761,12 +6867,17 @@ async function main() {
       const toolNames = turnData.tool_calls.map((t) => t.tool_name);
       recordPhaseTransition(db, currentPhase, turnId, skillNames, toolNames);
     }
-    db.prepare("UPDATE sessions SET turn_count = ? WHERE id = ?").run(turnNumber, sessionId);
+    const sessionTurnCount = db.prepare("SELECT COUNT(*) as count FROM turns WHERE session_id = ?").get(sessionId);
+    db.prepare("UPDATE sessions SET turn_count = ? WHERE id = ?").run(sessionTurnCount.count, sessionId);
     db.close();
     const output = {
       skipped: false,
       turnId,
-      ...importedCount > 0 ? { imported: importedCount } : {}
+      ...importedStats.turns > 0 ? {
+        imported: importedStats.turns,
+        importedSessions: importedStats.sessions,
+        importedTools: importedStats.tools
+      } : {}
     };
     console.log(JSON.stringify(output));
   } catch (error) {
